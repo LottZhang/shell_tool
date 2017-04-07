@@ -1,0 +1,1568 @@
+#!/usr/bin/python2.6
+#-*- coding:utf-8 -*-
+# {{{ import
+import sys, os, socket
+import traceback
+import copy, glob
+import time
+import signal
+import readline
+import logging as log
+
+from xml.etree import ElementTree
+from shterm.utils import _sleep, random_mac, deploy_file, validate_ipaddr, random_str, tempnam
+from shterm.config import connect_mc, file_logger, is_master
+from shterm.console2.network import *
+from shterm.console2 import *
+from shterm.console2 import admin
+from shterm.console2 import check
+from shterm.console2 import date
+from shterm.console2 import ha
+from shterm.console2 import service
+from shterm.console2 import status
+from shterm.console2 import shterm_config
+# }}}
+# {{{ base
+def menu_dummy():
+	print 'dummy handler'
+
+def check_passwd_expire(valid_date1, valid_date2):
+	now = time.strftime("%Y-%m-%d %H:%M:%S")
+	if (valid_date1 and valid_date1 >= now) or (valid_date2 and valid_date2 <= now):
+		return True
+	return False
+
+class MenuItem:
+	def __init__(self, title, handler):
+		self.title = title
+		self.handler = handler
+
+class Menu:
+	def __init__(self, header, show_return=True):
+		self.header = header
+		self.show_return = show_return
+		self.show_submit = False
+		self.lastkey = 1
+		self.keys = []
+		self.items = {}
+
+	def add_item(self, title, handler, key=None):
+		if not key:
+			key = self.lastkey
+			self.lastkey += 1
+		key = str(key)
+		if key in self.keys:
+			raise IndexError()
+		self.keys.append(key)
+		self.items[key] = MenuItem(title, handler)
+		return key
+
+	def get_item(self, key):
+		return self.items[key]
+
+	def render(self):
+		print self.header
+		for key in [ key for key in self.keys if key in map(str, range(0, self.lastkey))]:
+			print '    %s. %s' % (key, self.items[key].title)
+
+		for key in [ key for key in self.keys if key not in map(str, range(0, self.lastkey))]:
+			print '    %s. %s' % (key, self.items[key].title)
+
+		if self.show_submit:
+			print '    S. Submit'
+
+		if self.show_return:
+			print '    0. Return'
+
+	def special_handler(self, s):
+		return False
+
+	def submit_handler(self):
+		pass
+
+	def change_title(self):
+		pass
+
+	def run(self):
+		while True:
+			try:
+				print
+				self.change_title()
+				self.render()
+				try: s = raw_input('Enter selection: ').upper()
+				except EOFError: sys.exit(0)
+				if s == '': continue
+				if not self.special_handler(s):
+					if s in '0Q': break
+					if s in self.items: self.items[s].handler()
+					if s == 'S' : self.submit_handler()
+			except KeyboardInterrupt:
+				print
+			#except EOFError:
+			#	print
+# }}}
+# {{{ MenuDate
+class MenuNtp(Menu):
+	def __init__(self, clock, new_clock):
+		Menu.__init__(self, 'Network time Protocol', show_return=True)
+		self.clock = clock
+		self.new_clock = new_clock
+		self.ntpd = clock.ntpd
+		self.new_ntpd = new_clock.ntpd
+		self.init_title()
+		self.ntp_action = ('return','start','stop','restart')
+
+	def __call__(self):
+		log.info('Select Ntp')
+		self.run()
+
+	def ntp_status_handler(self):
+		while True:
+			n = raw_input('Select action (1. start, 2. stop, 3. restart, 0. return): ')
+			try: log.info('Select action %s' % self.ntp_action[int(n)])
+			except: log.error('Select action %s' % n)
+			if n == '1':
+				self.ntpd.start()
+				self.ntpd.save_config()
+				os.system('chkconfig ntpdate on')
+				return
+			if n == '2':
+				self.ntpd.stop()
+				os.system('chkconfig ntpdate off')
+				return
+			if n == '3':
+				self.ntpd.restart()
+				os.system('chkconfig ntpdate on')
+				return
+			if n == '0':
+				return
+		self.change_title()
+
+	def ntp_update_handler(self):
+		if self.ntpd.status != 'running':
+			log.info('Update ntpd')
+			self.ntpd.update_time()
+
+	def init_title(self):
+		self.add_item('NTP Service : %s' % self.new_ntpd.status, self.ntp_status_handler, key='X')
+		self.add_item('Add Server', self.add_server_handler, key='A')
+		self.add_item('Update time', self.ntp_update_handler, key='U')
+		for server in self.new_ntpd.servers:
+			self.add_item(server, self.remove_server_handler(self.lastkey))
+		self.change_title()
+
+
+	def change_title(self):
+		self.items['X'].title = 'NTP Service : %s' % self.new_ntpd.status
+		self.show_submit = self.ntpd.servers != self.new_ntpd.servers
+		if self.new_ntpd.status == 'running':
+			if self.keys.count('U') != 0:
+				self.keys.remove('U')
+		else:
+			if self.keys.count('U') == 0:
+				self.keys.append('U')
+
+	def add_server_handler(self):
+		n = raw_input('Please input new NTP server :')
+		if self.new_ntpd.servers.count(n) != 0 or self.ntpd.servers.count(n) != 0:
+			raw_input('Error: Name server is exstis, press enter to continue ...')
+			return
+
+		if n == '':
+			return
+
+		try:
+			self.new_ntpd.append(n)
+			self.add_item('%s A' % n, self.remove_server_handler(self.lastkey))
+			log.info('Add ntp server %s success' % n)
+		except InvalidNTPServer:
+			log.exception('Error ntp server name')
+			raw_input('Error: Invalid NTP server, press enter to continue ...')
+			return
+
+	def remove_server_handler(self, key_num):
+		def function():
+			key = str(key_num)
+			server = self.items[key].title
+			if server[-2:] == ' A':
+				n = raw_input('Remove server now, sure? (y/N)').upper()
+				if n == 'YES' or n == 'Y':
+					self.new_ntpd.servers.remove(server[:-2])
+					self.keys.remove(key)
+					del self.items[key]
+			elif self.new_ntpd.servers.count(server) != 0:
+				n = raw_input('Remove server now, sure? (y/N)').upper()
+				if n == 'YES' or n == 'Y':
+					self.new_ntpd.servers.remove(server)
+					self.items[key].title = '%s D' % server
+			else:
+				n = raw_input('This server will be remove, stop? (y/N)').upper()
+				if n == 'YES' or n == 'Y':
+					server = server[0:-2]
+					self.new_ntpd.servers.append(server)
+					self.items[key].title = server
+
+		return function
+
+	def submit_handler(self):
+		if self.new_ntpd.servers != self.ntpd.servers:
+			self.new_ntpd.save_config()
+			self.ntpd = self.new_ntpd
+			self.new_ntpd = copy.deepcopy(self.ntpd)
+			self.clock.ntpd = self.ntpd
+			self.new_clock.ntpd = self.new_ntpd
+			if self.new_ntpd.status == 'running':
+				self.new_ntpd.restart()
+
+			self.lastkey = 1
+			self.keys = list()
+			self.items = dict()
+			self.init_title()
+
+class MenuDate(Menu):
+	def __init__(self):
+		Menu.__init__(self, 'Date and Time', show_return=True)
+		self.clock = date.SystemClock()
+		self.clock.load_config()
+		self.new_clock = copy.deepcopy(self.clock)
+		self.add_item('', self.handler('date'))
+		self.add_item('', self.handler('time'))
+		self.add_item('Network Time Protocol', MenuNtp(self.clock, self.new_clock))
+
+	def __call__(self):
+		log.info("Select Data and Time")
+		self.run()
+
+	def change_title(self):
+		self.items['1'].title = 'Date : %s' % self.clock.date
+		self.items['2'].title = 'Time : %s' % self.clock.time
+
+		if self.clock.date != self.new_clock.date:
+			self.items['1'].title = 'Date : %s ==> %s' % (self.clock.date, self.new_clock.date)
+
+		if self.clock.time != self.new_clock.time:
+			self.items['2'].title = 'Time : %s ==> %s' % (self.clock.time, self.new_clock.time)
+
+		if self.clock != self.new_clock and self.clock.ntpd.status == 'stopped':
+			self.show_submit = True
+
+		if self.clock == self.new_clock or self.clock.ntpd.status == 'running':
+			self.show_submit = False
+
+	def handler(self, keyword):
+		def function():
+			if self.clock.ntpd.status == 'running':
+				raw_input('ntpd is running, it is not recommeneded to update the clock manually\npress enter to continue...')
+
+			n = raw_input('New %s : ' % keyword)
+			try:
+				setattr(self.new_clock, keyword, n)
+				log.info('Update date/time success')
+			except InvalidDate:
+				log.exception('Update date failure')
+				raw_input('Error:Invalid date, press enter to continue...')
+				return
+			except InvalidTime:
+				log.exception('Update time failure')
+				raw_input('Error:Invalid time, press enter to continue...')
+				return
+
+		return function
+
+	def submit_handler(self):
+		if self.clock != self.new_clock and self.clock.ntpd.status == 'stopped':
+			self.new_clock.deploy()
+			self.clock = self.new_clock
+			self.new_clock = copy.deepcopy(self.clock)
+# }}}
+# {{{ MenuNetwork
+class MenuNameserver(Menu):
+	def __init__(self, network, new_network):
+		Menu.__init__(self, 'Current DNS Server :', show_return=True)
+		self.network = network
+		self.new_network = new_network
+		self.init_title()
+
+	def __call__(self):
+		self.run()
+
+	def init_title(self):
+		self.add_item('Add New Server', self.add_server_handler, 'A')
+		for server in self.new_network.nameserver:
+			self.add_item(server, self.remove_server_handler(self.lastkey))
+
+	def change_title(self):
+		self.show_submit = (self.network.nameserver != self.new_network.nameserver)
+
+	def add_server_handler(self):
+		n = raw_input('Please input new nameserver :')
+		if self.new_network.nameserver.count(n) != 0 or self.network.nameserver.count(n) != 0:
+			raw_input('Error: Name server is exstis, press enter to continue ...')
+			return
+
+		if n == '':
+			return
+
+		try:
+			self.new_network.nameserver.append(n)
+			self.add_item('%s A' % n, self.remove_server_handler(self.lastkey))
+			log.info('Add name server %s success' % n)
+		except InvalidNameserver:
+			log.exception('Add name server failure')
+			raw_input('Error: Invalid name server, press enter to continue ...')
+
+	def remove_server_handler(self, key_num):
+		def function():
+			key = str(key_num)
+			server = self.items[key].title
+			if server[-2:] == ' A':
+				n = raw_input('Remove server now, sure? (y/N)').upper()
+				if n == 'YES' or n == 'Y':
+					self.new_network.nameserver.remove(server[:-2])
+					self.keys.remove(key)
+					del self.items[key]
+			elif self.new_network.nameserver.count(server) != 0:
+				n = raw_input('Remove server now, sure? (y/N)').upper()
+				if n == 'YES' or n == 'Y':
+					self.new_network.nameserver.remove(server)
+					self.items[key].title = '%s D' % server
+			else:
+				n = raw_input('This server will be remove, stop? (y/N)').upper()
+				if n == 'YES' or n == 'Y':
+					server = server[0:-2]
+					self.new_network.nameserver.append(server)
+					self.items[key].title = server
+
+		return function
+
+	def submit_handler(self):
+		if self.network.nameserver != self.new_network.nameserver:
+			self.new_network.nameserver.save_config()
+			self.network.nameserver = self.new_network.nameserver
+			self.new_network.nameserver = copy.deepcopy(self.network.nameserver)
+
+			self.lastkey = 1
+			self.keys = list()
+			self.items = dict()
+			self.init_title()
+
+			global config
+			config.local_network = self.network
+
+class MenuRoute(Menu):
+	def __init__(self, network):
+		Menu.__init__(self, 'Route Table: ', show_return=True)
+		self.route = Routes()
+		self.route.load_config()
+		self.network = network
+		self.new_route = copy.deepcopy(self.route)
+		self.init_title()
+
+	def __call__(self):
+		self.run()
+
+	def init_title(self):
+		for name in self.new_route.get_routes():
+			self.add_item(name, self.add_handler(self.lastkey))
+
+		self.add_item('Add', self.add_handler(), 'A')
+		self.add_item('Remove', self.remove_handler(), 'R')
+		self.add_item('Display Route', self.show_handler, 'D')
+
+	def change_title(self):
+		self.keys = []
+		self.items = {}
+		self.lastkey = 1
+
+		for name in self.new_route.get_routes():
+			self.add_item(name, self.add_handler(self.lastkey))
+
+		self.add_item('Add', self.add_handler(), 'A')
+		self.add_item('Remove', self.remove_handler(), 'R')
+		self.add_item('Display Route', self.show_handler, 'D')
+
+		self.show_submit = False
+		if self.route != self.new_route:
+			self.show_submit = True
+
+	def show_handler(self):
+		print
+		os.spawnv(os.P_WAIT, '/sbin/ip', ['ip', 'route'])
+
+	def add_handler(self, key_num=None):
+		def function(key_num=key_num):
+			if key_num:
+				old_rule = self.items[str(key_num)].title
+				rule = raw_input('Update route (orig: %s): ' % old_rule)
+			else:
+				rule = raw_input('Please input route (target[/netmask or masklen],gateway): ')
+
+			if rule == '':
+				return
+
+			n = raw_input('Are you sure (%s) ? (y/n)' % rule)
+			if n not in ('y', 'Y'):
+				raw_input('Abort, press enter to continue')
+				return
+
+			if rule.find(' ') >= 0: rule = rule.replace(' ', '')
+			try:
+				self.new_route.add(rule)
+				if key_num: self.new_route.remove(old_rule)
+			except Exception, e:
+				raw_input('Error : %s, press enter to continue' % e)
+				return
+
+			self.change_title()
+
+		return function
+
+	def remove_handler(self):
+		def function():
+			n = raw_input('Please input id: ')
+
+			try: int(n)
+			except:
+				print 'Error: Invalid input !'
+				return
+
+			if not self.items.get(n):
+				print 'Error: Invalid id, %s ! ' % n
+				return
+
+			rule = self.items[n].title
+			if raw_input('Remove (%s) now, sure? (y/N)' % rule).upper() == 'Y':
+				self.new_route.remove(rule)
+				self.change_title()
+
+		return function
+
+	def submit_handler(self):
+		self.new_route.save_config()
+
+		self.route = self.new_route
+		self.new_route = copy.deepcopy(self.route)
+		self.network.deploy()
+		self.new_route.deploy()
+
+		self.change_title()
+	
+class MenuHostInfo(Menu):
+	def __init__(self, network, new_network):
+		Menu.__init__(self, 'Current Host Info :', show_return=True)
+		self.network = network
+		self.new_network = new_network
+
+		global config
+		if config.config_model != 'read_from_shterm_config':
+			config.local_network = self.network
+
+		self.init_title()
+
+	def __call__(self):
+		self.run()
+
+	def init_title(self):
+		for key in map(str, range(0, 2)):
+			self.add_item('', None)
+
+	def change_title(self):
+		def function(name, keyword, key_num, interface=False):
+				if interface:
+					try: old_value = getattr(self.network.get_interface(self.device), keyword)
+					except: old_value = ''
+					try: new_value = getattr(self.new_network.get_interface(self.device), keyword)
+					except: new_value = ''
+				else:
+					try: old_value = getattr(self.network, keyword)
+					except: old_value = ''
+					try: new_value = getattr(self.new_network, keyword)
+					except: new_value = ''
+				title = '%-12s : %s' % (name, old_value)
+				if old_value != new_value:
+					title = '%-12s : %s ==> %s' % (name, old_value, new_value)
+					self.show_submit = True
+				key_num = str(key_num)
+				self.items[key_num].title = title
+				self.items[key_num].handler = self.handler(name, keyword)
+
+		self.show_submit = False
+		name_list = 'Hostname', 'Domain name',
+		keyword_list = 'hostname', 'domain',
+		interface_list = False, False
+		for i in range(2):
+			function(name_list[i], keyword_list[i], i+1, interface_list[i])
+
+	def submit_handler(self):
+		if self.network != self.new_network:
+			self.new_network.save_config()
+			self.new_network.deploy()
+
+			self.network = self.new_network
+			self.new_network = copy.deepcopy(self.network)
+
+			global config
+			config.local_network = self.network
+
+	def handler(self, name, keyword):
+		def function():
+			n = raw_input('New %s : ' % name)
+			if n == '':
+				return
+			if n.find('#') != -1:
+				raw_input('Error: Invalid %s, press enter to continue ...' % keyword)
+				return
+
+			if keyword in ('hostname', 'domain',):
+				if keyword == 'hostname' and n == 'localhost':
+					log.error('Error: Cannot use reserved name "localhost" as hostname')
+					raw_input('Error: Cannot use reserved name "localhost" as hostname, press enter to continue ...')
+					return
+				if keyword == 'hostname' and n.find('.') >= 0:
+					log.error('Error: Hostname cannot contain domain delimiter (".")')
+					raw_input('Error: Hostname cannot contain domain delimiter ("."), press enter to continue ...')
+					return
+				try:
+					setattr(self.new_network, keyword, n)
+					log.info('Config new network success: %s' % n)
+				except InvalidHostname:
+					log.exception('Error: Invalid host name')
+					raw_input('Error: Invalid host name, press enter to continue ...')
+					return
+				except InvalidDomain:
+					log.exception('Error: Invalid domain name')
+					raw_input('Error: Invalid domain name, press enter to continue ...')
+					return
+
+		return function
+
+	def special_handler(self, s):
+		if s in self.items.keys() + ['s', 'S'] and os.path.exists('/etc/shterm/ha.conf'):
+			print "***NOT allowed under HA. Q/0 to return to up menu.***"
+			return True
+		return False
+
+class MenuNetwork(Menu):
+	def __init__(self, device, network, new_network):
+		Menu.__init__(self, 'Network Configuration', show_return=True)
+		self.device = device
+		self.network = network
+		self.new_network = new_network
+
+		global config
+		if config.config_model != 'read_from_shterm_config':
+			config.local_network = self.network
+
+		self.init_title()
+
+	def __call__(self):
+		log.info('Select Network')
+		self.run()
+
+	def init_title(self):
+		for key in map(str, range(0, 3)):
+			self.add_item('', None)
+
+	def change_title(self):
+		def function(name, keyword, key_num, interface=False):
+			if interface:
+				try: old_value = getattr(self.network.get_interface(self.device), keyword)
+				except: old_value = ''
+				try: new_value = getattr(self.new_network.get_interface(self.device), keyword)
+				except: new_value = ''
+			else:
+				try: old_value = getattr(self.network, keyword)
+				except: old_value = ''
+				try: new_value = getattr(self.new_network, keyword)
+				except: new_value = ''
+			title = '%-12s : %s' % (name, old_value)
+			if old_value != new_value:
+				title = '%-12s : %s ==> %s' % (name, old_value, new_value)
+				self.show_submit = True
+			key_num = str(key_num)
+			self.items[key_num].title = title
+			self.items[key_num].handler = self.handler(name, keyword)
+
+		self.show_submit = False
+		#name_list = 'Hostname', 'Domain name', 'IP Address', 'Netmask', 'Gateway',
+		#keyword_list = 'hostname', 'domain', 'ipaddr', 'netmask', 'gateway',
+		#interface_list = False, False, True, True, True,
+		name_list = 'IP Address', 'Netmask', 'Gateway',
+		keyword_list = 'ipaddr', 'netmask', 'gateway',
+		interface_list = True, True, True,
+		for i in range(3):
+			function(name_list[i], keyword_list[i], i+1, interface_list[i])
+
+	def submit_handler(self):
+		if self.network != self.new_network:
+			global config
+
+			if self.new_network.hostname != config.local_network.hostname:
+				self.new_network.hostname = config.local_network.hostname
+			if self.new_network.domain != config.local_network.domain:
+				self.new_network.domain = config.local_network.domain
+
+			self.new_network.save_config()
+			self.new_network.deploy()
+
+			self.network = self.new_network
+			self.new_network = copy.deepcopy(self.network)
+
+			config.local_network = self.network
+
+	def handler(self, name, keyword):
+		def function():
+			n = raw_input('New %s : ' % name)
+			if n == '':
+				return
+			if n.find('#') != -1:
+				raw_input('Error: Invalid %s, press enter to continue ...' % keyword)
+				return
+
+			if keyword in ('ipaddr', 'netmask', 'gateway', ):
+				try:
+					setattr(self.new_network.get_interface(self.device), keyword, n)
+					log.info('Config network settings success %s %s' % (keyword, n))
+				except InvalidIpaddr:
+					log.exception('Config network settings failure Invalid IP')
+					raw_input('Error: Invalid IP address, press enter to continue ...')
+					return
+				except InvalidNetmask:
+					log.exception('Config network settings failure Invalid Netmask')
+					raw_input('Error: Invalid Netmask, press enter to continue ...')
+					return
+				except InvalidGateway:
+					log.exception('Config network settings failure Invalid Gateway')
+					raw_input('Error: Invalid Gateway, press enter to continue ...')
+					return
+
+		return function
+
+	def special_handler(self, s):
+		if s in self.items.keys() + ['s', 'S'] and os.path.exists('/etc/shterm/ha.conf'):
+			print "***NOT allowed under HA. Q/0 to return to up menu.***"
+			return True
+		return False
+
+class MenuNetDevice(Menu):
+	def __init__(self):
+		Menu.__init__(self, 'Network Devices', show_return=True)
+		self.network = Network()
+		self.network.load_config()
+
+		global config
+		if config.config_model != 'read_from_shterm_config':
+			config.local_network = self.network
+
+		self.new_network = copy.deepcopy(self.network)
+		self.init_title()
+
+	def __call__(self):
+		log.info('Select Network Device')
+		self.run()
+
+	def init_title(self):
+		devices = self.network.list_interfaces()
+		devices.sort()
+		for device in devices:
+			self.add_item(device, MenuNetwork(device, self.network, self.new_network))
+
+		self.add_item('Routes', MenuRoute(self.network), 'R')
+		self.add_item('DNS Servers', MenuNameserver(self.network, self.new_network), 'N')
+		self.add_item('Host Info', MenuHostInfo(self.network, self.new_network), 'H')
+		self.add_item('Add Net Device', self.add_device_handle, 'A')
+
+		#'hostname', 'domain'
+
+
+	def add_device_handle(self):
+		eth = raw_input('Please input eth device name :')
+
+		if eth == '':
+			return
+
+		if eth in self.network.list_interfaces():
+			raw_input('Eth device exists, press enter to continue')
+			return
+		
+		n = raw_input('Are you sure to add %s ? (y/n)' % eth)
+		if n not in ('y', 'Y'):
+			raw_input('Abort to add eth device, press enter to continue')
+			return
+
+		try:
+			self.new_network.set_interface(eth, '127.0.0.1', '255.255.255.0')
+		except Exception, e:
+			raw_input('Error : %s, press enter to continue' % e)
+			return
+
+		if self.network != self.new_network:
+			self.new_network.save_config()
+			self.new_network.deploy()
+
+			self.network = self.new_network
+			self.new_network = copy.deepcopy(self.network)
+
+			global config
+			config.local_network = self.network
+
+			self.add_item(eth, MenuNetwork(eth, self.network, self.new_network))
+
+# }}}
+# {{{ MenuService
+class MenuService(Menu):
+	def __init__(self):
+		Menu.__init__(self, 'Service Management', show_return=True)
+		self.httpd = service.Service('Http Server', 'httpd')
+		self.pgsql = service.Service('Database Server', 'postgresql')
+		self.nodehealthd = service.Service('Node Health Monitor', 'shterm-healthd')
+		self.permsrv = service.Service('Permission Server', 'shterm-permsrv')
+		self.loadmon = service.Service('Monitor Server', 'loadmon')
+		self.add_item('', self.handler('pgsql'))
+		self.add_item('', self.handler('httpd'))
+		self.add_item('', self.handler('nodehealthd'))
+		self.add_item('', self.handler('permsrv'))
+		self.add_item('', self.handler('loadmon'))
+		if os.path.exists('/etc/shterm/ha.conf'):
+			self.heartbeat = service.Service('Heartbeat', 'heartbeat')
+			self.add_item('', self.handler('heartbeat'))
+		self.change_title()
+		self.action = ('return', 'start', 'stop', 'restart')
+
+	def __call__(self):
+		log.info('Select Service')
+		self.run()
+
+	def change_title(self):
+		self.items['1'].title = '%-20s : %s' % (self.pgsql.name, self.pgsql.status)
+		self.items['2'].title = '%-20s : %s' % (self.httpd.name, self.httpd.status)
+		self.items['3'].title = '%-20s : %s' % (self.nodehealthd.name, self.nodehealthd.status)
+		self.items['4'].title = '%-20s : %s' % (self.permsrv.name, self.permsrv.status)
+		self.items['5'].title = '%-20s : %s' % (self.loadmon.name, self.loadmon.status)
+		if os.path.exists('/etc/shterm/ha.conf'):
+			self.items['6'].title = '%-20s : %s' % (self.heartbeat.name, self.heartbeat.status)
+
+	def handler(self, keyword):
+		def function():
+			while True:
+				n = raw_input('Select action (1. start, 2. stop, 3. restart, 0. return): ')
+				try: log.info('Service %s action %s' % (keyword, self.action[int(n)]))
+				except: log.info('Service %s action %s' % (keyword, n))
+				if n == '1':
+					getattr(self, keyword).start()
+					break
+				elif n == '2':
+					getattr(self, keyword).stop()
+					break
+				elif n == '3':
+					getattr(self, keyword).restart()
+					break
+				elif n == '0':
+					break
+
+			return
+
+		return function
+# }}}
+# {{{ MenuHA
+class MenuMain(Menu):
+	def __init__(self, config):
+		Menu.__init__(self, 'High Availability Configuration', show_return = True)
+		self.config = config
+		self.new_config = copy.deepcopy(self.config)
+
+		self.add_item('', None)
+		self.add_item('', None)
+		self.add_item('', None)
+		self.add_item('', None)
+		self.add_item('', None)
+		self.add_item('', None)
+		self.add_item('', None)
+		self.add_item('', None)
+		self.add_item('Deploy', self.deploy_handler, key='D')
+
+	def __call__(self):
+		log.info('Select Main HA')
+		if self.config.server_model == '':
+			n = raw_input('This server will be main server, continue? (y/N)').upper()
+			if n == 'Y':
+				self.config.server_model = 'main_server'
+				self.config.save_config()
+				global config
+				config.server_model = self.config.server_model
+			else:
+				return
+
+		if self.config.server_model == 'backup_model':
+			raw_input('Error: this server is backup server')
+			return
+
+		self.run()
+
+	def change_title(self):
+		def function(name, keyword, key_num):
+			old_value = getattr(self.config, keyword)
+			new_value = getattr(self.new_config, keyword)
+			title = '%-16s : %s' % (name, old_value)
+			if old_value != new_value:
+				title = '%-16s : %s ==> %s' % (name, old_value, new_value)
+				self.show_submit = True
+			key_num = str(key_num)
+			self.items[key_num].title = title
+			self.items[key_num].handler = self.handler(name, keyword)
+
+		self.show_submit = False
+		name_list = 'Float IP address', 'Ping Node address', 'Remote IP Address', 'Heartbeat Device', 'Hearbeat Device Hostname', 'Main HB IP address', 'Backup HB IP address', 'Third part backup ip',
+		self.keyword_list = 'float_ipaddr', 'ping_node_ip', 'ipaddr2', 'hadevice', 'hahostname', 'local_ha_ip', 'remote_ha_ip', 'third_part_ip',
+		for i in range(8):
+			function(name_list[i], self.keyword_list[i], i+1)
+
+	def deploy_handler(self):
+		for keyword in self.keyword_list:
+			if not getattr(self.config, keyword):
+				raw_input('Error: Data not completion, press enter to continue ...')
+				return
+
+		n = raw_input('Deploy now, are you sure? (y/N)').upper()
+		if n == 'Y':
+			log.info('Deploy main ha config')
+			common_server = ha.CommonModel()
+			common_server.config_pgsql()
+			common_server.config_service()
+
+			main_server = ha.MainServerModel(self)
+			main_server.deploy()
+
+			global config
+			config = self.config
+
+
+	def handler(self, name, keyword):
+		def function():
+			n = raw_input('New %s : ' % name)
+			if n == '':
+				return
+			if n.find('#') != -1:
+				raw_input('Error: Invalid %s, press enter to continue ...' % keyword)
+				return
+
+			try:
+				setattr(self.new_config, keyword, n)
+				log.info('MainHA: Config %s success , value: %s' % (keyword, n))
+			except InvalidPingNode:
+				log.exception('Error: Invalid ping node')
+				raw_input('Error: Invalid ping node, press enter to continue ...')
+				return
+			except InvalidFloatIpaddr:
+				log.exception('Error: Invalid float ip address')
+				raw_input('Error: Invalid float ip address, press enter to continue ...')
+				return
+			except InvalidIpaddr:
+				log.exception('Error: Invalid remote ip address')
+				raw_input('Error: Invalid remote ip address, press enter to continue ...')
+				return
+			except InvalidHostname:
+				log.exception('Error: Invalid heart beat hostname')
+				raw_input('Error: Invalid heart beat hostname, press enter to continue ...')
+				return
+			except InvalidDevice:
+				log.exception('Error: Invalid heart beat device')
+				raw_input('Error: Invalid heart beat device, press enter to continue ...')
+				return
+
+		return function
+
+	def submit_handler(self):
+		if self.new_config != self.config:
+			self.new_config.local_network = self.config.local_network
+			self.new_config.save_config()
+			self.config = self.new_config
+			self.new_config = copy.deepcopy(self.config)
+
+			global config
+			config = self.config
+
+class MenuBackup(Menu):
+	def __init__(self, config):
+		Menu.__init__(self, 'Hight Availability Configuration', show_return = True)
+		self.config = config
+		self.new_config = copy.deepcopy(config)
+
+		self.add_item('', None)
+		self.add_item('', None)
+		self.add_item('Deploy', self.deploy_handler, key='D')
+
+	def __call__(self):
+		log.info('Select Backup HA')
+		if self.config.server_model == '':
+			n = raw_input('This server will be backup server, continue? (y/N)').upper()
+			if n == 'Y':
+				self.config.server_model = 'backup_server'
+				self.config.save_config()
+				global config
+				config.server_model = self.config.server_model
+			else:
+				return
+
+		if self.config.server_model == 'main_server':
+			raw_input('Error: this server is main server')
+			return
+
+		self.run()
+
+	def change_title(self):
+		def function(name, keyword, key_num):
+			old_value = getattr(self.config, keyword)
+			new_value = getattr(self.new_config, keyword)
+			title = '%-12s : %s' % (name, old_value)
+			if old_value != new_value:
+				title = '%-12s : %s ==> %s' % (name, old_value, new_value)
+				self.show_submit = True
+			key_num = str(key_num)
+			self.items[key_num].title = title
+			self.items[key_num].handler = self.handler(name, keyword)
+
+		self.show_submit = False
+		name_list = 'Allow IP address 1', 'Allow IP address 2',
+		self.keyword_list = 'allow_ip1', 'allow_ip2',
+		for i in range(2):
+			function(name_list[i], self.keyword_list[i], i+1)
+
+	def handler(self, name, keyword):
+		def function():
+			n = raw_input('New %s : ' % name)
+			if n == '':
+				return
+			if n.find('#') != -1:
+				raw_input('Error: Invalid %s, press enter to continue ...' % keyword)
+				return
+
+			try:
+				setattr(self.new_config, keyword, n)
+				log.info('HA Backup new config %s success value %s' % (keyword, n))
+			except InvalidIpaddr:
+				log.exception('Error: Invalid allow ip address')
+				raw_input('Error: Invalid allow ip address, press enter to continue ...')
+				return
+
+		return function
+
+	def submit_handler(self):
+		if self.new_config != self.config:
+			self.new_config.local_network = self.config.local_network
+			self.new_config.save_config()
+			self.config = self.new_config
+			self.new_config = copy.deepcopy(self.config)
+
+			global config
+			config = self.config
+
+	def deploy_handler(self):
+		n = raw_input('Deploy now, are you sure? (y/N)').upper()
+		if n == 'Y':
+			log.info('Deploy backup ha config')
+			self.config.save_config()
+			common_server = ha.CommonModel()
+			common_server.config_pgsql()
+			common_server.config_service()
+
+			backup_server = ha.BackupServerModel()
+			backup_server.auth()
+			backup_server.check_status()
+
+
+class MenuHA(Menu):
+	def __init__(self):
+		Menu.__init__(self, 'High Availability Configuration', show_return = True)
+		# global config
+		# menu_main = MenuMain(config)
+		# menu_backup = MenuBackup(config)
+
+		# if config.server_model:
+		# 	if config.server_model == 'main_server':
+		# 		self.add_item('Main Server Mode', menu_main)
+		# 	if config.server_model == 'backup_server':
+		# 		self.add_item('Backup Server Mode', menu_backup)
+		# else:
+		# 	self.add_item('Main Server Mode', menu_main)
+		# 	self.add_item('Backup Server Mode', menu_backup)
+
+		self.add_item('Takeover', self.handler('takeover', True), key='T')
+		self.add_item('Standby', self.handler('standby', True), key='S')
+		self.add_item('Status', self.handler('status', False), key='X')
+		self.add_item('Normal Sync(do at standby)', self.handler('normalsync', True))
+
+	def handler(self, action, prompt):
+		def po(cmd):
+			p = os.popen(cmd + ' 2>/dev/null | uniq')
+			res = p.read().strip()
+			p.close()
+			return res
+
+		def exec_():
+			log.info('HA action: %s' % action)
+			if action == 'status':	# bloody damn ugly
+				nodes = po('cl_status listnodes').split('\n')
+				links, title = {}, ""
+				for n in nodes:
+					links[n] = [L.strip() for L in po('cl_status listhblinks %s' % n).split('\n')]
+					links[n].sort()
+					title += "%s: nodestatus, %s | " % (n, ', '.join(links[n]))
+
+				title = "hbstatus, rscstatus | %s" % title
+				print title
+				print '-' * len(title)
+				while True:
+					hbstatus = po('cl_status hbstatus').split(' ')[2]
+					rscstatus = po('cl_status rscstatus')
+					res = "%s, %s | " % (hbstatus, rscstatus)
+					for n in nodes:
+						nodestatus = po('cl_status nodestatus %s' % n)
+						res += nodestatus
+						for L in links[n]:
+							res += ', ' + po('cl_status hblinkstatus %s %s' % (n, L))
+							res += ' | '
+					print res
+					time.sleep(2)
+			elif action in ('takeover', 'standby'):
+				os.system('/usr/share/heartbeat/hb_%s' % action)
+			elif action == 'normalsync':
+				os.system('/usr/libexec/shterm/sync/update')
+				print "***sync done.***"
+			else:
+				pass
+
+		def function():
+			try:
+				if not prompt:
+					exec_()
+				elif raw_input('Are you sure?(y/n) ').upper() == 'Y':
+					exec_()
+			except EOFError:
+				sys.exit(0)
+
+		return function
+
+	def __call__(self):
+		log.info('Select HA')
+		if os.path.exists('/etc/shterm/ha.conf'):
+			log.info('Show HA Menu')
+			self.run()
+		else:
+			log.info('***HA not configured!***')
+			print
+			print "***HA not configured!***"
+
+# }}}
+# {{{ MenuStatus
+
+class MenuStatus(Menu):
+	def __init__(self):
+		Menu.__init__(self, 'System Status', show_return=True)
+		self.status = status.SystemStatus()
+		self.add_item('Show Status', self.status.status)
+		self.add_item('vmstat', self.status.vmstat)
+		self.add_item('Reboot System', self.reboot_handler)
+		self.add_item('Shutdown System', self.shutdown_handler)
+
+	def __call__(self):
+		log.info('Select System Status')
+		self.run()
+
+	def reboot_handler(self):
+		v = raw_input('Reboot the system, are you sure? (y/N): ').upper()
+		if v == 'Y' or v == 'YES':
+			log.info('Reboot system')
+			self.status.reboot()
+
+	def shutdown_handler(self):
+		v = raw_input('Shutdown the system, are you sure? (y/N): ').upper()
+		if v == 'Y' or v == 'YES':
+			log.info('Shutdown system')
+			self.status.poweroff()
+# }}}
+# {{{ MenuTools
+class MenuTools(Menu):
+	def __init__(self):
+		Menu.__init__(self, 'System Tools', show_return=True)
+		self.add_item('Ping', self.ping_handler)
+		self.add_item('Traceroute', self.traceroute_handler)
+		self.add_item('Telnet', self.telnet_handler)
+
+	def __call__(self):
+		log.info('Select System Tools')
+		self.run()
+
+	def ping_handler(self):
+		v = raw_input('Ip address: ')
+		if validate.ipaddr(v):
+			log.info('Ping address %s' % v)
+			os.system('ping -c 3 %s' % v)
+
+	def traceroute_handler(self):
+		v = raw_input('Ip address: ')
+		if validate.ipaddr(v):
+			log.info('Traceroute address %s' % v)
+			os.system('traceroute -n %s' % v)
+
+	def telnet_handler(self):
+		log.info('Telnet')
+		os.system('SHELL=/bin/false telnet')
+# }}}
+# {{{ MenuAdmin
+class MenuIdentity(Menu):
+	def __init__(self, db_result):
+		self.st_map = ('disabled', 'active')
+		Menu.__init__(self, 'Identity configuation', show_return=True)
+		identity_id_pwlock = 'identity_%d_pwlock' % db_result[0]
+		self.identity = admin.Identity(db_result[0], db_result[1], db_result[2])
+		self.add_item('Change status', self.change_status_handler)
+		self.add_item('Change passwd', self.change_passwd_handler)
+		mc = connect_mc()
+		if mc.get(identity_id_pwlock) == '1': self.add_item('Unlock', self.change_lock_handler)
+
+	def __call__(self):
+		log.info('Config for user: %s' % self.identity.name)
+		self.run()
+
+	def change_status_handler(self):
+		log.info('Change user status')
+		while True:
+			n = raw_input('New status (1. disabled, 2. active, 0. return): ')
+			if n in ('1', '2'):
+				try:
+					status = self.identity.status = int(n) - 1
+				except DBConnectError:
+					log.exception('Change user status to %s failure' % self.st_map[status])
+					raw_input('Error: Can`t connect database')
+					return
+				log.info('Change user status to %s success' % self.st_map[status])
+				return
+
+			if n == '0':
+				return
+
+	def change_passwd_handler(self):
+		log.info('Change user password')
+		n1 = sec_input('New password: ')
+		n2 = sec_input('Confirm password: ')
+		if n1 == n2:
+			try:
+				self.identity.passwd = n1
+			except DBConnectError:
+				log.exception('Change user password failure')
+				raw_input('Error: Can`t connect database')
+				return
+			log.info('Change user password success')
+			raw_input('Password have been successfully changed, press enter to continue ...')
+			return
+		else:
+			raw_input('Error: Password mismatch')
+			return
+
+	def change_lock_handler(self):
+		while True:
+			n = raw_input('Unlock (1. Unlock, 0. return): ')
+			if n == '1':
+				self.identity.unlock = 1
+				return
+			if n == '0':
+				return
+
+class MenuAdmin(Menu):
+	def __init__(self):
+		Menu.__init__(self, 'Administrators', show_return=True)
+		self.status_map = { 0: 'Disabled', 1: 'Active' }
+		self.status_lock = { 0: 'Locked' }
+		self.identity_list = dict()
+		self.init_title()
+
+	def __call__(self):
+		log.info('Select Administrator')
+		self.run()
+#		admin.DB.closeDB()
+
+	def init_title(self):
+		self.add_item('local root', self.change_root_passwd_handler, key='R')
+		try:
+			db_results = admin.Identity.getIdentities()
+			for result in db_results:
+				status= self.status_map[result[2]]
+				if check_passwd_expire(result[3], result[4]): status='Account Expire'
+				title = '%s [%s]' % (result[1], status)
+				self.identity_list[result[0]] = self.add_item(title, MenuIdentity(result))
+		except DBConnectError:
+			raw_input('Error: Can`t connect database')
+			return
+
+	def change_title(self):
+		for k, v in self.identity_list.items():
+			self.keys.remove(v)
+			del self.items[v]
+			del self.identity_list[k]
+		self.lastkey = 1
+		try:
+			db_results = admin.Identity.getIdentities()
+			for result in db_results:
+				status= self.status_map[result[2]]
+				if check_passwd_expire(result[3], result[4]): status='Account Expire'
+                                identity_id_pwlock = 'identity_%d_pwlock' % result[0]
+                                mc = connect_mc()
+                                if (mc.get(identity_id_pwlock) ==  '1' ) and ( result[2] == 1 ):
+                                        title = '%s [%s]' % (result[1], self.status_lock[0])
+                                else :
+					title = '%s [%s]' % (result[1], status)
+				self.identity_list[result[0]] = self.add_item(title, MenuIdentity(result))
+		except DBConnectError:
+			raw_input('Error: Can`t connect database')
+			return
+
+	def change_root_passwd_handler(self):
+		user = admin.SystemUser()
+		user.change_passwd()
+# }}}
+# {{{ Menu Appsrv
+class MenuAppsrv(Menu):
+	def __init__(self):
+		Menu.__init__(self, 'Appsrv Management', show_return=True)
+		self.appsrv_name = 'appsrv'
+		self.add_item('Domain info', self.domain_info)
+		self.add_item('Power on', self.power_on)
+		self.add_item('Power off', self.power_off)
+		self.add_item('Managed Save Remove', self.managed_save_remove)
+		self.add_item('Recovery', self.recovery, key='R')
+		self.add_item('VNC console', self.vnc_console, key='V')
+		self.add_item('Create appsrv', self.create_appsrv, key='C')
+		self.add_item('Auto start appsrv', self.auto_start, key='A')
+		self.add_item('Initialize services', self.init_services, key='I')
+		#self.add_item('Backup', self.backup, key='B')
+
+	def __call__(self):
+		log.info('Select AppSrv Action')
+		if not self.__check_support():
+			log.info('Your device don\'t support kvm !')
+			print 'Your device don\'t support kvm !'
+			return
+
+		if glob.glob('/var/lib/shterm/kvm/*.bz2'):
+			log.info('Show Appsrv Menu')
+			self.run()
+		else:
+			log.info('*** Please upload image first ***')
+			print
+			print '*** Please upload image first ***'
+
+	def __status(self):
+		try:
+			with os.popen('virsh domstate %s 2>/dev/null' % self.appsrv_name) as f:
+				status = f.read().strip()
+		except:
+			status = None
+
+		return status
+
+	def __check_support(self):
+		return os.system("grep -E 'svm|vmx' /proc/cpuinfo > /dev/null 2>&1") == 0
+
+	def __check_alive(self):
+		return self.__status() == 'running'
+
+	def __check_install(self):
+		return self.__status() in ('shut off', 'running')
+
+	def __get_define_name(self, xml_path):
+		tree = ElementTree.ElementTree()
+		root = tree.parse(xml_path)
+		try: name = root.find('name').text
+		except: name = None
+		return name
+
+	def __undefine_net(self):
+		if not os.system('virsh net-list | grep default'):
+			args = ['virsh', 'net-destroy', 'default']
+			os.spawnv(os.P_WAIT, '/usr/bin/virsh', args)
+			args = ['virsh', 'net-undefine', 'default']
+			os.spawnv(os.P_WAIT, '/usr/bin/virsh', args)
+
+	def __define_appsrv(self, xml_config):
+		#init mac and uuid
+		tmp_config = tempnam()
+		mac_pool = list(set([random_mac() for i in range(10)]))
+		with open(xml_config, 'r') as f:
+			data = f.read()
+		for i in reversed(range(data.count('$mac_address'))):
+			name = '$mac_address'
+			if i: name += str(i)
+			data = data.replace(name, mac_pool.pop())
+		rstr = random_str
+		data = data.replace('$uuid', '%s-%s-%s-%s-%s' % (rstr(8,8), rstr(4,4), rstr(4,4), rstr(4,4), rstr(12,12)))
+		with open(tmp_config, 'w') as f:
+			f.write(data)
+
+		self.__undefine_net()
+		args = ['virsh', 'define', tmp_config]
+		os.spawnv(os.P_WAIT, '/usr/bin/virsh', args)
+		os.unlink(tmp_config)
+
+		args = ['virsh', 'autostart', self.appsrv_name]
+		os.spawnv(os.P_WAIT, '/usr/bin/virsh', args)
+
+	def __undefine_appsrv(self):
+		args = ['virsh', 'undefine', self.appsrv_name]
+		os.spawnv(os.P_WAIT, '/usr/bin/virsh', args)
+
+	def auto_start(self):
+		appsrvs = [ os.path.basename(i) for i in glob.glob('/etc/libvirt/qemu/*.xml') ]
+		autostart = [ os.path.basename(i) for i in glob.glob('/etc/libvirt/qemu/autostart/*.xml') ]
+
+		for appsrv in appsrvs:
+			print appsrvs.index(appsrv) + 1, '%s (autostart=%s)' % (appsrv, appsrv in autostart)
+
+		n = raw_input('Select appsrv: ')
+		try:
+			appsrv = appsrvs[int(n) - 1]
+		except:
+			print 'Select xml error!'
+			log.error('Select xml: %s, selected: %s' % (appsrvs, n))
+			return
+
+		name = self.__get_define_name('/etc/libvirt/qemu/%s' % appsrv)
+		if appsrv in autostart:
+			if raw_input('Manual start %s? [y/n]' % appsrv).lower() == 'y':
+				args = ['virsh', 'autostart', '--disable', name]
+				os.spawnv(os.P_WAIT, '/usr/bin/virsh', args)
+		else:
+			if raw_input('Auto start %s? [y/n]' % appsrv).lower() == 'y':
+				args = ['virsh', 'autostart', name]
+				os.spawnv(os.P_WAIT, '/usr/bin/virsh', args)
+
+	def create_appsrv(self):
+		xml_list = glob.glob('/var/lib/shterm/kvm/*.xml')
+		for xml in xml_list:
+			print '%d. %s' % (xml_list.index(xml) + 1, os.path.basename(xml))
+
+		#select and check image/xml valid
+		n = raw_input('Select xml: ')
+		try:
+			xml_config = xml_list[int(n) - 1]
+		except:
+			print 'Select xml error!'
+			log.error('Select xml: %s, selected: %s' % (xml_list, n))
+			return
+
+		if self.__check_install():
+			if self.__check_alive():
+				print 'Application server is running!'
+				log.info('Application server is running!')
+				self.power_off()
+
+			if self.__check_alive():
+				print 'Application server is still running, skip recovery!'
+				log.info('Application server is still running, skip recovery!')
+				return
+			self.__undefine_appsrv()
+
+		self.__define_appsrv(xml_config)
+
+	def vnc_console(self):
+		ipaddr = raw_input('Please input vnc listening ipaddr: ')
+		if not validate_ipaddr(ipaddr):
+			print 'Invalid ipaddr: %s' % ipaddr
+			return
+		try:
+			os.system('/usr/libexec/shterm/vmconsole.sh %s' % ipaddr) 
+		except (EOFError, IOError, OSError, ValueError, KeyboardInterrupt), e:
+			pass
+
+	def init_services(self):
+		print 'Initializing service ..., please wait!'
+		log.info('init service for kvm')
+
+		services = ('ksm', 'ksmtuned', 'libvirtd', 'libvirt-guests', 'lvm2-monitor', 'messagebus', 'avahi-daemon')
+		for service in services:
+			args = ['chkconfig', service, 'on']
+			os.spawnv(os.P_WAIT, '/sbin/chkconfig', args)
+		print 'Please reboot your system to take effect!'
+
+	def domain_info(self):
+		try:
+			with os.popen('virsh dominfo %s' % self.appsrv_name) as f:
+				print f.read().strip()
+		except:
+			log.exception('general exception when get domain_info: %s' % self.appsrv_name)
+
+	def managed_save_remove(self):
+		if raw_input('recover appsrv? [y/n]').lower() == 'y':
+			log.info('recover appsrv')
+
+			if not self.__check_alive():
+				args = ['virsh', 'managedsave-remove', self.appsrv_name]
+				os.spawnv(os.P_WAIT, '/usr/bin/virsh', args)
+			else:
+				print 'appsrv is running, ignore!'
+
+	def power_on(self):
+		if raw_input('start appsrv? [y/n]').lower() == 'y':
+			log.info('starting appsrv')
+			
+			if not self.__check_alive():
+				args = ['virsh', 'start', self.appsrv_name]
+				os.spawnv(os.P_WAIT, '/usr/bin/virsh', args)
+			else:
+				print 'appsrv already started!'
+
+	def power_off(self):
+		if raw_input('force shutdown appsrv? [y/n]').lower() == 'y':
+			log.info('force shutdown appsrv')
+			
+			if self.__check_alive():
+				args = ['virsh', 'destroy', self.appsrv_name]
+				os.spawnv(os.P_WAIT, '/usr/bin/virsh', args)
+			else:
+				print 'appsrv already stopped!'
+
+	def recovery(self):
+		if raw_input('Recovery appsrv? [y/n]').lower() == 'y':
+			log.info('recovery appsrv')
+			img_list = glob.glob('/var/lib/shterm/kvm/*.bz2')
+			for img in img_list:
+				print '%d. %s' % (img_list.index(img) + 1, os.path.basename(img))
+
+			#select and check image/xml/part exist
+			n = raw_input('Select img: ')
+			try:
+				img_path = img_list[int(n) - 1]
+				xml_config = img_path.replace('.bz2','.xml')
+				if not os.access(xml_config, os.F_OK):
+					print 'config file %s not found' % xml_config
+					log.info('config file %s not found' % xml_config)
+					return
+				log.info('Select img: %s' % img_path)
+			except:
+				print 'Select image error!'
+				log.error('Select img: %s' % n)
+				return
+
+			#force stop and undefine orignal kvm if exist
+			if self.__check_install():
+				if self.__check_alive():
+					print 'Application server is running!'
+					log.info('Application server is running!')
+					self.power_off()
+
+				if self.__check_alive():
+					print 'Application server is still running, skip recovery!'
+					log.info('Application server is still running, skip recovery!')
+					return
+
+				self.__undefine_appsrv()
+
+			#recovery image to logical volumn
+			if not self.__check_install():
+				print '%s, starting recovery please wait ...' % time.strftime('%Y-%m-%d %H:%M:%S')
+				os.system('pbzip2 -cdkv -m1024 %s > /dev/vg01/%s' % (img_path, self.appsrv_name))
+				print '%s, recovery finished!' % time.strftime('%Y-%m-%d %H:%M:%S')
+
+				#define kvm
+				if raw_input('Create Appsrv now? [y/n]').lower() == 'y':
+					self.__define_appsrv(xml_config)
+					self.power_on()
+	'''
+	def backup(self):
+		if raw_input('Backup appsrv? [y/n]').upper() == 'Y':
+			log.info('backup appsrv')
+			if self.__check_alive():
+				print 'Found application server is running'
+				self.power_off()
+
+			args = ['virsh', 'dumpxml', self.appsrv_name, '>', '/var/lib/shterm/kvm/user_backup.xml']
+			os.spawnv(os.P_WAIT, '/usr/bin/virsh', args)
+
+			args = ['pbzip2', '-czk', '-m500', '<', '/dev/vm/%s' % self.appsrv_name img_path, '>', /var/lib/shterm/kvm/user_backup.bz2']
+			os.spawnv(os.P_WAIT, '/usr/bin/pbzip2', args)
+
+	'''
+#}}}
+# {{{ Menuroot
+def menu_root(s):
+	if s == 'ROOT':
+		cha = check.cha()
+		cal = check.cal(cha)
+		token = raw_input('Challenge is %s, enter password to continue: ' % cha).strip()
+		if token and check.check(cha, token): return True
+
+		handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
+		_sleep(1)
+		signal.signal(signal.SIGINT, handler)
+		return False
+# }}}
+# {{{ Main
+global config
+def main():
+	global config
+	check.bash()
+
+	config = shterm_config.ConsoleConfig()
+	config.load_config()
+
+	ssh_connection = os.getenv('SSH_CONNECTION')
+	if ssh_connection:
+		ssh_connection = ssh_connection.split()[0].split(':')[-1]
+	argv = sys.argv
+
+	if len(argv) > 2 and argv[1] == '-c':
+		if ssh_connection not in ('127.0.0.1', config.allow_ip1, config.allow_ip2):
+			log.info('SSH connection forbidden')
+			sys.exit(1)
+
+		if argv[2] == 'shutdown_service':
+			service = service.Service('', argv[3])
+			service.status = 'off'
+			log.info('Shutdown service')
+			sys.exit(0)
+
+		if argv[2] == 'startup_service':
+			service = service.Service('', argv[3])
+			service.status = 'on'
+			log.info('Startup service')
+			sys.exit(0)
+
+		os.system(' '.join(argv[2:]))
+		log.info('execute %s' % ' '.join(argv[2:]))
+		sys.exit(0)
+
+	if config.config_model == 'read_from_shterm_config':
+		config.config_model = 'unknown'
+		config.local_network.save_config()
+		config.save_config()
+		log.info('Read from shterm config')
+		sys.exit(0)
+
+	make_menu()
+	config.save_config()
+
+
+def make_menu():
+	menu = Menu('Main Menu', show_return=False)
+	menu.special_handler = menu_root
+
+	menu.add_item('Date and Time', MenuDate())
+	menu.add_item('Network Configuration', MenuNetDevice())
+	menu.add_item('Service Management', MenuService())
+	menu.add_item('High Availability', MenuHA(), key='H')
+	menu.add_item('Administrators', MenuAdmin())
+	menu.add_item('System Status', MenuStatus(), key='S')
+	menu.add_item('System Tools', MenuTools(), key='T')
+	menu.add_item('Application Server', MenuAppsrv(), key='A')
+
+	menu.run()
+
+if __name__ == '__main__':	
+	if os.getuid() == 0: file_logger('/tmp/logs/console2.log', 'INFO')
+	try:
+		main()
+	except Exception, e:
+		print >> sys.stderr, traceback.print_exc()
+		if raw_input('console2 general exception , we recommend you resolve this problem in root shell (y/n)?').lower() == 'y':
+			menu_root('ROOT')
+# }}}

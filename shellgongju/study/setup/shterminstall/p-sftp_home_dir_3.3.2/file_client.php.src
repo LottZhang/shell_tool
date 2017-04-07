@@ -1,0 +1,136 @@
+<?PHP
+require_once("common.php");
+
+if (!@$CONFIG["fileclient_token_expire"]) $CONFIG["fileclient_token_expire"] = 300;
+if (!@$CONFIG["fileclient_token_times"]) $CONFIG["fileclient_token_times"] = 5;
+
+function _auth_ticket($service, $username, $ipaddr, $options=false) {
+        global $CONFIG;
+
+        if (!$options) $options = array();
+        $options["websid"] = session_id();
+        $options = json_encode($options);
+        $prefix = "OTP1:";
+        $saltlen = 10;
+        $timeout = intval($CONFIG["fileclient_token_expire"]);
+        $times = intval($CONFIG["fileclient_token_times"]);
+        $mc = connect_mc();
+        $id = $mc->increment("otp1_seq");
+        if (!$id) {
+        $id = 1;
+        $mc->set("otp1_seq", $id);
+        }
+        $salt = randstr($saltlen, $no=-1);
+        $key = sprintf('otp1-%08x', $id);
+        $s = sprintf("SHTERM %s%08x %s %s %s", $prefix, $id, $username, $service, $salt);
+        $mc->set($key, sha1($s), 0, $timeout);
+        if ($times>1) $mc->set($key . "t", strval($times), 0, $timeout);
+        $mc->set($key . "x", $options, 0, $timeout);
+
+        return sprintf($prefix . "%s%x", $salt, $id);
+}
+
+assert_method("POST");
+$CONFIG['nomenu'] = true;
+if (array_key_exists("expire", $_SESSION)) {
+	$_SESSION["expire"] = time() + intval(get_policy("session_timeout"))*60;
+}
+
+$account_manual_input_remote = $account_manual_input_passwd = "";
+if (@$req_account_manual_input_remote) {
+	$account_manual_input_remote = @$req_account_manual_input_remote;
+}
+if (@$req_account_manual_input_passwd) {
+	$account_manual_input_passwd = @$req_account_manual_input_passwd;
+}
+
+$server = load_server($req_server);
+if (!$server) fatal(_("cl.file_client.error.server"));
+if (intval($server["status"]) == 0)  fatal(_("cl.file_client.server.forbidden"));
+$account = load_account($req_account);
+if (!$account) fatal(_("cl.file_client.error.account"));
+$service = load_service($req_service);
+if (!$service) fatal(_("cl.file_client.error.service"));
+
+$port = @$CONFIG["options"]["access_port_tui"];
+if(!$port){
+	$port = 22;
+}
+
+if(@$req_authorize){
+	$priority= get_policy("dualauth_priority");
+	$subject = get_policy("dualauth_subject");
+	$s = authorize_identities($req_authorize_login,$req_authorize_password);
+        if($s !== true) {
+		if(strlen($priority)){
+			#$event_res = event_log("dual auth", $CONFIG["nodeid"], $subject, $CONFIG["REMOTE_ADDR"], $_SESSION["user_id"], intval($req_server), intval($req_account), $priority, "authorizer: " . $req_authorize_login . ", dual authorize fail");
+			$event_res = event_send("dual auth", $CONFIG["nodeid"], $subject, $CONFIG["REMOTE_ADDR"], $_SESSION["user_id"], intval($req_server), intval($req_account), $priority, "authorizer: " . $req_authorize_login . ", dual authorize fail");
+			if (strcmp($event_res, 'ERROR') == 0) fatal(_("cl.file_client.error.record"));
+		}
+		if (strcmp($s, "sync")==0) fatal(sprintf(_("cl.tui_client.error.totpsync"),htmlspc($req_authorize_login)));
+		else fatal($s);
+	} else {
+		if(strlen($priority)){
+			#$event_res = event_log("dual auth", $CONFIG["nodeid"], $subject, $CONFIG["REMOTE_ADDR"], $_SESSION["user_id"], intval($req_server), intval($req_account), $priority, "authorizer: " . $req_authorize_login . ", dual authorize success");
+			$event_res = event_send("dual auth", $CONFIG["nodeid"], $subject, $CONFIG["REMOTE_ADDR"], $_SESSION["user_id"], intval($req_server), intval($req_account), $priority, "authorizer: " . $req_authorize_login . ", dual authorize success");
+			if (strcmp($event_res, 'ERROR') == 0) fatal(_("cl.file_client.error.record"));
+		}
+	}
+}
+
+$extra_path = "";
+if ($service['proto'] == 'sftp') {
+	if ($account["remote"] == "any") {
+		exec("$CONFIG[direxec]/get_sftp_workdir $server[id] $service[id] --any-account $account_manual_input_remote --any-passwd $account_manual_input_passwd", $res, $rc);
+	} else {
+		exec("$CONFIG[direxec]/get_sftp_workdir $server[id] $service[id] $account[id]", $res, $rc);
+	}
+	if (!$rc) $extra_path = $res[0];
+}
+
+$CONFIG['submenu1'] = _("cl.file_client.pos").": $server[name] ($server[ipaddr])\n";
+$shell_orderby = get_policy("shell_orderby");
+if ($shell_orderby == "ipaddr") {
+	$path = "$server[ipaddr] ($server[name] $service[name])/$account[remote]";
+} else {
+	$path = "$server[name] $service[name] ($server[ipaddr])/$account[remote]";
+}
+
+$worksheets = list_worksheets($_SESSION['user_id']);
+$ms = list_mgroup_ids('identity', $_SESSION['user_id']);
+$ms = mgroup_check_limit($ms);
+foreach($ms as $m_id) {
+	$one = load_mgroup($m_id);
+	if (strlen(trim($one["worksheet"]))) $CONFIG['worksheet_mgroups'][$m_id] = $one;
+	else $CONFIG['mgroups'][$m_id] = $one;
+}
+
+$all_server = list_server_ids($ms);
+
+if (!in_array($req_server, $all_server)) fatal(_("cl.file_client.noauth"));
+
+$user = $_SESSION['user_id'];
+
+$ms = array();
+$ms = common_mgroup_ids($user,$req_server,false,$req_account);
+if(!count($ms)) fatal(_("cl.file_client.error.account.access"));
+
+if ($account["remote"] == "any") {
+	$mc = connect_mc();
+	$skey = randstr(10);
+	$mc->set("${skey}_account", $account_manual_input_remote, false, 900);
+	$mc->set("${skey}_passwd", $account_manual_input_passwd, false, 900);
+	$path = $path . "_$skey";
+}
+
+if ($extra_path) $path .= $extra_path;
+
+$ticket = _auth_ticket("sshd", $_SESSION["user_login"], $CONFIG["REMOTE_ADDR"]);
+
+$a[] = "Host";
+$s = schedule($_SESSION["user_id"], $CONFIG["REMOTE_ADDR"], $req_server, $req_account, $req_service);
+$a[] = $s[0][1];
+$params = array("Host"=>$s[0][1], "User"=>"$_SESSION[user_login]", "PWD"=>"$ticket", "Path"=>"$path", "Port"=>$port);
+$_SESSION["server_grid_has_recent"] = true;
+echo json_encode($params);
+?>

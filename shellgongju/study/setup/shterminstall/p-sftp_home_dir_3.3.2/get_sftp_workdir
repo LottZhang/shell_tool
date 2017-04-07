@@ -1,0 +1,99 @@
+#!/usr/bin/python2.6
+# -*- coding:utf-8 -*-
+
+import os, sys
+from shterm import config
+from shterm.sftp3.consts import *
+from shterm.sftp3.sftp import SftpRequest, FileAttr
+from shterm.sftp3.client import SftpClient
+from shterm.model import ServerPassword, SSHPrivateKey, Service
+from shterm.model import Account, Server, ObjectNotFoundException
+from shterm.sshkey import prepare_private_key
+
+from subprocess import Popen, PIPE, STDOUT
+
+def get_sftp_workdir(account_remote, sftp_host, sftp_port, passwd=None, keyfile=None):
+	peer = SftpClient(sftp_host)
+	if passwd:
+		peer.connect(account_remote, sftp_port, passwd=passwd)
+	elif keyfile:
+		peer.connect(account_remote, sftp_port, keyfile=keyfile)
+	else:
+		return 1, 'ERROR: no password and key configured'
+
+	req = SftpRequest(SSH_FXP_REALPATH, 1)                                                               
+	res = peer.peer.realpath(req, '', '.')
+
+	if not hasattr(res, 'message'):
+		return 0, res.names[0].short
+	else:
+		return 1, 'ERROR: %s' % res.message
+
+def main():
+	any_account = None
+	any_password = None
+
+	if '--any-account' in sys.argv:
+		idx = sys.argv.index('--any-account')
+		any_account = sys.argv[idx + 1]
+		del(sys.argv[idx + 1])
+		del(sys.argv[idx])
+
+	if '--any-passwd' in sys.argv:
+		idx = sys.argv.index('--any-passwd')
+		any_password = sys.argv[idx + 1]
+		del(sys.argv[idx + 1])
+		del(sys.argv[idx])
+
+	server_id = sys.argv[1]
+	service_id = sys.argv[2]
+
+	session = config.get_session()
+	try:
+		server = Server.load(server_id)
+		service = Service.load(service_id)
+	except ObjectNotFoundException, e:
+		sys.stdout.write('ERROR: %s' % e)
+		sys.exit(1)
+
+	if not server.ipaddr:
+		sys.stdout.write('ERROR: server %s ipaddr not configure' % server.name)
+		sys.exit(1)
+
+	port = service.port
+	if not port:
+		ssh_service = server.default_service('ssh')
+		port = ssh_service.port or 22
+
+	if any_account:
+		rc, res = get_sftp_workdir(any_account, server.ipaddr, port, any_password)
+		sys.stdout.write(res)
+		exit(rc)
+
+	account_id = sys.argv[3]
+
+	try: 
+		account = Account.load(account_id)
+	except ObjectNotFoundException, e:
+		sys.stdout.write('ERROR: %s' % e)
+		sys.exit(1)
+
+	passwd = keyfile = None
+
+	try: 
+		sp = ServerPassword.load(server=server_id, account=account_id)
+		passwd = sp.get_passwd_str(0, int(server_id), int(account_id), login='apache')
+	except ObjectNotFoundException:
+		try: 
+			SSHPrivateKey.load(server=server_id, account=account_id)
+			keyfile = prepare_private_key(int(account_id), int(server_id), login='apache')
+		except ObjectNotFoundException:
+			pass
+
+	rc, res = get_sftp_workdir(account.remote, server.ipaddr, port, passwd, keyfile)
+	sys.stdout.write(res)
+
+	exit(rc)
+
+if __name__ == '__main__':
+	main()

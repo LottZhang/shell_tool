@@ -1,0 +1,77 @@
+#!/bin/bash
+ifconfig eth1 up 
+vconfig add eth1 1000
+vconfig add eth1 1001
+vconfig add eth1 1002
+vconfig add eth1 1003
+vconfig add eth1 1004
+vconfig add eth1 1005
+vconfig add eth1 1006
+vconfig add eth1 1007
+vconfig add eth1 1008
+vconfig add eth1 1009
+vconfig add eth1 1010
+vconfig add eth1 1011
+vconfig add eth1 1012
+ifconfig eth1.1000 up
+ifconfig eth1.1001 up
+ifconfig eth1.1002 up
+ifconfig eth1.1003 up
+ifconfig eth1.1004 up
+ifconfig eth1.1005 up
+ifconfig eth1.1006 up
+ifconfig eth1.1007 up
+ifconfig eth1.1008 up
+ifconfig eth1.1009 up
+ifconfig eth1.1010 up
+ifconfig eth1.1011 up
+ifconfig eth1.1012 up
+#vim /etc/dhcp/dhcpd.conf
+ifconfig eth1.1000 192.168.199.1
+ifconfig eth1.1001 192.168.50.1
+ifconfig eth1.1002 192.168.35.1
+ifconfig eth1.1003 192.168.195.1
+ifconfig eth1.1004 192.168.60.1
+ifconfig eth1.1005 192.168.70.1
+ifconfig eth1.1006 192.168.20.1
+ifconfig eth1.1007 192.168.80.1
+ifconfig eth1.1008 192.168.51.1
+ifconfig eth1.1009 192.168.52.1
+ifconfig eth1.1010 192.168.53.1
+ifconfig eth1.1011 192.168.54.1
+ifconfig eth1.1012 192.168.33.1
+dhcpd -cf /etc/dhcp/dhcpd.conf
+#cat iptable.txt 
+echo 1 > /proc/sys/net/ipv4/ip_forward
+pppoe-server -I eth1.1000 -L 10.18.99.1 -R 10.18.99.2
+pppoe-server -I eth1.1001 -L 10.18.99.1 -R 10.18.99.2
+pppoe-server -I eth1.1002 -L 10.18.99.1 -R 10.18.99.2
+pppoe-server -I eth1.1003 -L 10.18.99.1 -R 10.18.99.2
+pppoe-server -I eth1.1004 -L 10.18.99.1 -R 10.18.99.2
+pppoe-server -I eth1.1005 -L 10.18.99.1 -R 10.18.99.2
+pppoe-server -I eth1.1006 -L 10.18.99.1 -R 10.18.99.2
+pppoe-server -I eth1.1007 -L 10.18.99.1 -R 10.18.99.2
+pppoe-server -I eth1.1008 -L 10.18.99.1 -R 10.18.99.2
+pppoe-server -I eth1.1009 -L 10.18.99.1 -R 10.18.99.2
+pppoe-server -I eth1.1010 -L 10.18.99.1 -R 10.18.99.2
+pppoe-server -I eth1.1011 -L 10.18.99.1 -R 10.18.99.2
+pppoe-server -I eth1.1012 -L 10.18.99.1 -R 10.18.99.2
+
+#ps aux |grep dhcpd
+#ps aux |grep pppoe
+#cat iptable.txt 
+iptables -t nat -A POSTROUTING -s 10.18.99.0/24 -j SNAT --to 192.168.10.108 -o eth0
+iptables -t nat -A POSTROUTING -s 192.168.199.0/24 -j SNAT --to 192.168.10.108 -o eth0
+iptables -t nat -A POSTROUTING -s 192.168.50.0/24 -j SNAT --to 192.168.10.108 -o eth0
+iptables -t nat -A POSTROUTING -s 192.168.35.0/24 -j SNAT --to 192.168.10.108 -o eth0
+iptables -t nat -A POSTROUTING -s 192.168.195.0/24 -j SNAT --to 192.168.10.108 -o eth0
+iptables -t nat -A POSTROUTING -s 192.168.60.0/24 -j SNAT --to 192.168.10.108 -o eth0
+iptables -t nat -A POSTROUTING -s 192.168.70.0/24 -j SNAT --to 192.168.10.108 -o eth0
+iptables -t nat -A POSTROUTING -s 192.168.20.0/24 -j SNAT --to 192.168.10.108 -o eth0
+iptables -t nat -A POSTROUTING -s 192.168.80.0/24 -j SNAT --to 192.168.10.108 -o eth0
+iptables -t nat -A POSTROUTING -s 192.168.51.0/24 -j SNAT --to 192.168.10.108 -o eth0
+iptables -t nat -A POSTROUTING -s 192.168.52.0/24 -j SNAT --to 192.168.10.108 -o eth0
+iptables -t nat -A POSTROUTING -s 192.168.53.0/24 -j SNAT --to 192.168.10.108 -o eth0
+iptables -t nat -A POSTROUTING -s 192.168.54.0/24 -j SNAT --to 192.168.10.108 -o eth0
+iptables -t nat -A POSTROUTING -s 192.168.33.0/24 -j SNAT --to 192.168.10.108 -o eth0
+
